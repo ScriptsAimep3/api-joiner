@@ -1,129 +1,129 @@
 from flask import Flask, request, jsonify
-import os
-import json
-from datetime import datetime
+import time
+import secrets
 
 app = Flask(__name__)
 
-# ====== CONFIG ======
-DATA_FILE = "keys.json"
+# ================= STORAGE (SIMPLE) =================
+# En producción puedes cambiar a DB real
 
-# ====== UTILIDADES ======
-def load_keys():
-    if not os.path.exists(DATA_FILE):
-        return {}
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+keys = {}
+discord_users = {}
+hwid_map = {}
 
-def save_keys(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4)
+# ================= UTILS =================
 
-# ====== RUTA PRINCIPAL ======
+def gen_key():
+    return "VZe" + secrets.token_hex(16)
+
+# ================= ROUTES =================
+
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
-        "status": "online",
         "service": "api-joiner",
-        "time": datetime.utcnow().isoformat()
+        "status": "online",
+        "time": time.time()
     })
 
-# ====== VALIDAR KEY (ROBLOX) ======
-@app.route("/api/key-validation", methods=["POST"])
-def validate_key():
-    data = request.get_json(silent=True)
+# -------- CREATE KEY (BOT) --------
 
-    if not data:
-        return jsonify({
-            "valid": False,
-            "message": "Body JSON requerido"
-        }), 400
-
-    key = data.get("key")
-    hwid = data.get("hwid")
-
-    if not key or not hwid:
-        return jsonify({
-            "valid": False,
-            "message": "Key y HWID requeridos"
-        }), 400
-
-    keys_db = load_keys()
-
-    if key not in keys_db:
-        return jsonify({
-            "valid": False,
-            "message": "Key inválida"
-        }), 403
-
-    key_data = keys_db[key]
-
-    # Si la key no tiene HWID asignado, se asigna al primero
-    if key_data["hwid"] is None:
-        key_data["hwid"] = hwid
-        keys_db[key] = key_data
-        save_keys(keys_db)
-
-    # Verificar HWID
-    if key_data["hwid"] != hwid:
-        return jsonify({
-            "valid": False,
-            "message": "HWID no autorizado"
-        }), 403
-
-    return jsonify({
-        "valid": True,
-        "message": "Acceso autorizado"
-    }), 200
-
-# ====== CREAR KEY (DISCORD / ADMIN) ======
 @app.route("/api/create-key", methods=["POST"])
 def create_key():
-    data = request.get_json(silent=True)
-    if not data or "key" not in data:
-        return jsonify({"error": "Key requerida"}), 400
+    data = request.json
+    duration = data.get("duration")
 
-    key = data["key"]
+    if not duration:
+        return jsonify({"error": "duration required"}), 400
 
-    keys_db = load_keys()
-
-    if key in keys_db:
-        return jsonify({"error": "La key ya existe"}), 409
-
-    keys_db[key] = {
-        "hwid": None,
-        "created_at": datetime.utcnow().isoformat()
+    key = gen_key()
+    keys[key] = {
+        "expires": int(time.time()) + int(duration),
+        "used": False
     }
-
-    save_keys(keys_db)
 
     return jsonify({
         "success": True,
         "key": key
-    }), 201
+    })
 
-# ====== BORRAR KEY ======
-@app.route("/api/delete-key", methods=["POST"])
-def delete_key():
-    data = request.get_json(silent=True)
-    if not data or "key" not in data:
-        return jsonify({"error": "Key requerida"}), 400
+# -------- REDEEM KEY (DISCORD) --------
 
-    key = data["key"]
-    keys_db = load_keys()
+@app.route("/api/redeem-key", methods=["POST"])
+def redeem_key():
+    data = request.json
+    key = data.get("key")
+    discord_id = data.get("discord_id")
 
-    if key not in keys_db:
-        return jsonify({"error": "Key no existe"}), 404
+    if key not in keys:
+        return jsonify({"error": "Invalid key"}), 400
 
-    del keys_db[key]
-    save_keys(keys_db)
+    if keys[key]["used"]:
+        return jsonify({"error": "Key already used"}), 400
 
-    return jsonify({
-        "success": True,
-        "deleted": key
-    }), 200
+    keys[key]["used"] = True
+    discord_users[discord_id] = {
+        "key": key,
+        "expires": keys[key]["expires"]
+    }
 
-# ====== MAIN ======
+    return jsonify({"success": True})
+
+# -------- DISCORD CHECK --------
+
+@app.route("/api/discord-check", methods=["POST"])
+def discord_check():
+    data = request.json
+    discord_id = data.get("discord_id")
+
+    user = discord_users.get(discord_id)
+    if not user:
+        return jsonify({"active": False})
+
+    if user["expires"] < time.time():
+        return jsonify({"active": False})
+
+    return jsonify({"active": True})
+
+# -------- KEY VALIDATION (ROBLOX) --------
+
+@app.route("/api/key-validation", methods=["POST"])
+def key_validation():
+    data = request.json
+    key = data.get("key")
+    hwid = data.get("hwid")
+
+    if key not in keys:
+        return jsonify({"valid": False, "message": "Invalid key"}), 200
+
+    if keys[key]["expires"] < time.time():
+        return jsonify({"valid": False, "message": "Key expired"}), 200
+
+    if key in hwid_map and hwid_map[key] != hwid:
+        return jsonify({"valid": False, "message": "HWID mismatch"}), 200
+
+    hwid_map[key] = hwid
+    return jsonify({"valid": True, "message": "Access granted"}), 200
+
+# -------- RESET HWID --------
+
+@app.route("/api/reset-hwid", methods=["POST"])
+def reset_hwid():
+    data = request.json
+    discord_id = data.get("discord_id")
+
+    user = discord_users.get(discord_id)
+    if not user:
+        return jsonify({"error": "No active key"}), 400
+
+    key = user["key"]
+    hwid_map.pop(key, None)
+
+    return jsonify({"success": True})
+
+# ================= RUN =================
+
 if __name__ == "__main__":
+    import os
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
